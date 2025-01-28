@@ -1,6 +1,8 @@
 #include "M5Cardputer.h"
 #include "MCS6502.h"
+#include "a02.h"
 #include <vector>
+#include <stdio.h>
 #include "keys.h"
 
 #define MEMORY_SIZE 0x10000 // 64kib
@@ -13,11 +15,18 @@
 #define TXT_COLS (SCR_W/FNT_W)// Text columns
 #define TXT_ROWS (SCR_H/FNT_H)// Text rows
 
+#define MAX(a,b) (a>b?a:b)
+#define MIN(a,b) (a>b?a:b)
+
 #define BIT(n) (1<<(n-1))
 
 enum EmuRunMode {
   RUN_MODE_STEP,
   RUN_MODE_AUTO
+};
+char *EmuRunModeText[] = {
+  "STEP",
+  "RUN"
 };
 struct EmuState {
   EmuRunMode runMode = RUN_MODE_STEP;
@@ -27,6 +36,9 @@ struct EmuState {
 EmuState currentState;
 MCS6502ExecutionContext context;
 uint8 memory[MEMORY_SIZE];
+
+int selection = -1;
+
 uint64_t lastMicros;
 uint64_t lastScreenUpdateMicros;
 
@@ -62,6 +74,7 @@ char* format_text(const char *format, ...) {
 void setup() {
   Serial.begin(921600);
   Serial.println("hi");
+
   auto cfg = M5.config();
   M5Cardputer.begin(cfg,true);
 
@@ -83,28 +96,47 @@ void setup() {
   memory[0xfffc] = 0x00;
   memory[0xfffd] = 0x08;
 
-  memory[0x800] = 0x69;
-  memory[0x801] = 0x01;
-  memory[0x802] = 0x4C;
-  memory[0x803] = 0x00;
-  memory[0x804] = 0x08;
+  for (int i=0;i<10;i++) // set some values
+    memory[0x100+i]=i;
+
+  memory[0x800] = 0x7d; // ADC $100,X
+  memory[0x801] = 0x00;
+  memory[0x802] = 0x01;
+  memory[0x803] = 0x4c; // JMP $800
+  memory[0x804] = 0x00;
+  memory[0x805] = 0x08;
 
   MCS6502Reset(&context);
+  updateScreen();
+
+  in_text=std::string("");
+  in_text+=";CPU 6502\n";
+  in_text+="ORG $0800\n";
+  in_text+="main:\n";
+  in_text+="  LDA #$05\n";
+  Serial.println("assembling...");
+  assemble();
+  Serial.println("Done");
+  Serial.println(out_text.size());
+  Serial.println(out_text.c_str());
+  Serial.println("---------");
+  Serial.println(list_text.size());
+  Serial.println(list_text.c_str());
 }
 
-char* getStatusString() {
-  char* str = (char*)malloc(100);
-  
-  char cool_str[6]; // 5 byte test string at 0x100
-  for (int i=0;i<5;i++)
-    cool_str[i]=memory[0x100+i];
-  
+void drawTextWithSelection(int selectIdx, char* str, int x, int y, int color = TFT_GREEN) {
+  M5Cardputer.Display.setTextColor(selection == selectIdx ? TFT_BLACK : color);
+  if (selection == selectIdx) M5Cardputer.Display.fillRect(x,y,FNT_W*strlen(str),FNT_H,color);
+  M5Cardputer.Display.drawString(str,x,y);
+  M5Cardputer.Display.setTextColor(color);
+}
+
+// Gets the dissassembled instruction at the current Program Counter
+char* getCurrentInst() {
   byte opcode = memory[context.pc];
   MCS6502Instruction* instruction = MCS6502OpcodeTable[opcode];
   char * dis = DisassembleCurrentInstruction(instruction, &context);
-
-  sprintf(str,"PC=%04x A=%02x %s",context.pc,context.a,dis);
-  return str;
+  return dis;
 }
 
 void showRAMImage() {
@@ -120,10 +152,10 @@ void showRAMImage() {
 }
 
 void drawCPUState(int ox, int oy) {
-  M5Cardputer.Display.drawString(format_text("PC=%04x",context.pc),ox+0,oy+FNT_H*0);
-  M5Cardputer.Display.drawString(format_text("A=%02x",context.a),  ox+0,oy+FNT_H*1);
-  M5Cardputer.Display.drawString(format_text("X=%02x",context.x),  ox+0,oy+FNT_H*2);
-  M5Cardputer.Display.drawString(format_text("Y=%02x",context.y),  ox+0,oy+FNT_H*3);
+  drawTextWithSelection(0,format_text("PC=%04x",context.pc),ox+0,oy+FNT_H*0);
+  drawTextWithSelection(1,format_text("A=%02x",context.a),  ox+0,oy+FNT_H*1);
+  drawTextWithSelection(2,format_text("X=%02x",context.x),  ox+0,oy+FNT_H*2);
+  drawTextWithSelection(3,format_text("Y=%02x",context.y),  ox+0,oy+FNT_H*3);
   M5Cardputer.Display.drawString(format_text("SP=%02x",context.sp),ox+0,oy+FNT_H*4);
   M5Cardputer.Display.drawString(format_text("%c%c%c%c%c%c%c%c",
     context.p & BIT(7) ? 'N' : 'n',
@@ -135,14 +167,21 @@ void drawCPUState(int ox, int oy) {
     context.p & BIT(1) ? 'Z' : 'z',
     context.p & BIT(0) ? 'C' : 'c'
   ),ox+0,oy+FNT_H*5);
+  M5Cardputer.Display.drawString(getCurrentInst(),ox+0,oy+FNT_H*6);
+}
+
+void drawEmuState(int ox, int oy) {
+  M5Cardputer.Display.drawString(format_text("%s", EmuRunModeText[currentState.runMode]), ox+0, oy+0);
+  M5Cardputer.Display.drawString(format_text("%04dHz",currentState.clockSpeed), ox+SCR_W-6*FNT_W, oy+0); // Justify right
 }
 
 void updateScreen() {
   M5Cardputer.Display.clearDisplay();
   // M5Cardputer.Display.drawString(getStatusString(),0,0);
   // M5Cardputer.Display.drawString(format_text("test %x",context.pc),0,0);
-  drawCPUState(0,0);
-  M5Cardputer.Display.drawString(format_text("%04dHz",currentState.clockSpeed),SCR_W-6*FNT_W,SCR_H-FNT_H);
+  drawEmuState(0,0);
+  M5Cardputer.Display.drawFastHLine(0,FNT_H-1,SCR_W,TFT_WHITE);
+  drawCPUState(0,FNT_H*1);
 }
 
 void emuTick() {
@@ -155,6 +194,10 @@ void emuTick() {
 }
 
 void onKeyPress(char c) {
+  if (c>='0' && c<='9') {
+    context.x=c-'0';
+    updateScreen();
+  }
   switch (c) {
     case KEY_STEP:
       emuTick();
@@ -166,9 +209,21 @@ void onKeyPress(char c) {
       break;
     case '[':
       currentState.clockSpeed -= 10;
+      updateScreen();
       break;
     case ']':
       currentState.clockSpeed += 10;
+      updateScreen();
+      break;
+    case ';': // up arrow
+      selection--;
+      selection = MAX(selection,-1); // min value is -1
+      updateScreen();
+      break;
+    case '.': // down arrow
+      selection++;
+      // TODO add a maximum value
+      updateScreen();
       break;
   }
 }
