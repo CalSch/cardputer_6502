@@ -1,9 +1,11 @@
 #include "M5Cardputer.h"
 #include "MCS6502.h"
-#include "a02.h"
+#include "6502pasm.h"
+#include "asm_editor.h"
 #include <vector>
 #include <stdio.h>
 #include "keys.h"
+#include "util.h"
 
 #define MEMORY_SIZE 0x10000 // 64kib
 
@@ -33,8 +35,15 @@ struct EmuState {
   int clockSpeed = 100; // in Hz
 };
 
-EmuState currentState;
+enum InterfaceState {
+  INTERFACE_EMU,
+  INTERFACE_EDITOR
+};
+
+InterfaceState interfaceState;
+EmuState emuState;
 MCS6502ExecutionContext context;
+Assembler assembler;
 uint8 memory[MEMORY_SIZE];
 
 int selection = -1;
@@ -55,21 +64,6 @@ void writeBytesFunction(uint16 addr, uint8 byte, void * readWriteContext) {
   memory[addr] = byte;
 }
 
-char* format_text(const char *format, ...) {
-    free(format_scratch);
-
-    va_list args;
-
-    va_start(args, format);
-    if(0 > vasprintf(&format_scratch, format, args)) format_scratch = NULL;    //this is for logging, so failed allocation is not fatal
-    va_end(args);
-
-    if(format_scratch) {
-      return format_scratch;
-    } else {
-      return "uh oh";
-    }
-}
 
 void setup() {
   Serial.begin(921600);
@@ -86,42 +80,56 @@ void setup() {
   
   MCS6502Init(&context, readBytesFunction, writeBytesFunction, NULL);  // Final param is optional context.
 
-  for (int i=0;i<MEMORY_SIZE;i++)
-    memory[i] = 0;
-
+  emuHardReset();
 
   M5Cardputer.Display.drawString("hello",0,0);
 
-  // set reset vector to 0x800
-  memory[0xfffc] = 0x00;
-  memory[0xfffd] = 0x08;
+  Serial.println("writing text...");
 
-  for (int i=0;i<10;i++) // set some values
-    memory[0x100+i]=i;
+  assembler.input_lines.push_back(std::string(".ORG $0800"));
+  assembler.input_lines.push_back(std::string("main:"));
+  assembler.input_lines.push_back(std::string(" lda #$00"));
+  assembler.input_lines.push_back(std::string(" ldx #$05"));
+  assembler.input_lines.push_back(std::string("loop:"));
+  assembler.input_lines.push_back(std::string(" adc #$03"));
+  assembler.input_lines.push_back(std::string(" dex"));
+  assembler.input_lines.push_back(std::string(" bne loop"));
+  assembler.input_lines.push_back(std::string("end:"));
+  assembler.input_lines.push_back(std::string(" jmp end"));
 
-  memory[0x800] = 0x7d; // ADC $100,X
-  memory[0x801] = 0x00;
-  memory[0x802] = 0x01;
-  memory[0x803] = 0x4c; // JMP $800
-  memory[0x804] = 0x00;
-  memory[0x805] = 0x08;
+  editor.code = assembler.input_lines;
+  
+  emuAssembleAndLoad();
 
-  MCS6502Reset(&context);
-  updateScreen();
-
-  in_text=std::string("");
-  in_text+=";CPU 6502\n";
-  in_text+="ORG $0800\n";
-  in_text+="main:\n";
-  in_text+="  LDA #$05\n";
-  Serial.println("assembling...");
-  assemble();
   Serial.println("Done");
-  Serial.println(out_text.size());
-  Serial.println(out_text.c_str());
-  Serial.println("---------");
-  Serial.println(list_text.size());
-  Serial.println(list_text.c_str());
+  Serial.println(assembler.output_bytes.size());
+  // Serial.println(assembler.output_bytes.c_str());
+  // Serial.println("---------");
+  // Serial.println(list_text.size());
+  // Serial.println(list_text.c_str());
+
+  updateScreen();
+}
+
+void emuHardReset() {
+  for (int i=0;i<MEMORY_SIZE;i++)
+    memory[i] = 0;
+  
+  MCS6502Reset(&context);
+  context.pc=0x800;
+}
+
+void emuAssembleAndLoad() {
+  Serial.println("assembling...");
+
+  assembler.assemble();
+
+  Serial.println("writing to memory...");
+
+  for (int i=0;i<assembler.output_bytes.size();i++) {
+    // printf("  mem[%04x] = %02x\n",i,i,assembler.output_bytes[i]);
+    memory[i]=assembler.output_bytes[i];
+  }
 }
 
 void drawTextWithSelection(int selectIdx, char* str, int x, int y, int color = TFT_GREEN) {
@@ -142,7 +150,7 @@ char* getCurrentInst() {
 void showRAMImage() {
   for (int i=0;i<MEMORY_SIZE;i++) {
     char r = memory[i+0];
-    if ((i)/240<135)
+    if ((i)<135*240)
     M5Cardputer.Display.drawPixel(
       (i)%240,
       (i)/240,
@@ -153,9 +161,9 @@ void showRAMImage() {
 
 void drawCPUState(int ox, int oy) {
   drawTextWithSelection(0,format_text("PC=%04x",context.pc),ox+0,oy+FNT_H*0);
-  drawTextWithSelection(1,format_text("A=%02x",context.a),  ox+0,oy+FNT_H*1);
-  drawTextWithSelection(2,format_text("X=%02x",context.x),  ox+0,oy+FNT_H*2);
-  drawTextWithSelection(3,format_text("Y=%02x",context.y),  ox+0,oy+FNT_H*3);
+  drawTextWithSelection(1,format_text("A=%02x,%03d",context.a,context.a),  ox+0,oy+FNT_H*1);
+  drawTextWithSelection(2,format_text("X=%02x,%03d",context.x,context.x),  ox+0,oy+FNT_H*2);
+  drawTextWithSelection(3,format_text("Y=%02x,%03d",context.y,context.y),  ox+0,oy+FNT_H*3);
   M5Cardputer.Display.drawString(format_text("SP=%02x",context.sp),ox+0,oy+FNT_H*4);
   M5Cardputer.Display.drawString(format_text("%c%c%c%c%c%c%c%c",
     context.p & BIT(7) ? 'N' : 'n',
@@ -171,8 +179,8 @@ void drawCPUState(int ox, int oy) {
 }
 
 void drawEmuState(int ox, int oy) {
-  M5Cardputer.Display.drawString(format_text("%s", EmuRunModeText[currentState.runMode]), ox+0, oy+0);
-  M5Cardputer.Display.drawString(format_text("%04dHz",currentState.clockSpeed), ox+SCR_W-6*FNT_W, oy+0); // Justify right
+  M5Cardputer.Display.drawString(format_text("%s", EmuRunModeText[emuState.runMode]), ox+0, oy+0);
+  M5Cardputer.Display.drawString(format_text("%04dHz",emuState.clockSpeed), ox+SCR_W-6*FNT_W, oy+0); // Justify right
 }
 
 void updateScreen() {
@@ -182,6 +190,7 @@ void updateScreen() {
   drawEmuState(0,0);
   M5Cardputer.Display.drawFastHLine(0,FNT_H-1,SCR_W,TFT_WHITE);
   drawCPUState(0,FNT_H*1);
+  // showRAMImage();
 }
 
 void emuTick() {
@@ -194,6 +203,7 @@ void emuTick() {
 }
 
 void onKeyPress(char c) {
+  Serial.printf("key: %c\n",c);
   if (c>='0' && c<='9') {
     context.x=c-'0';
     updateScreen();
@@ -204,15 +214,15 @@ void onKeyPress(char c) {
       updateScreen();
       break;
     case KEY_TOGGLE_RUN_MODE:
-      if (currentState.runMode == RUN_MODE_STEP) currentState.runMode = RUN_MODE_AUTO;
-      else if (currentState.runMode == RUN_MODE_AUTO) currentState.runMode = RUN_MODE_STEP;
+      if (emuState.runMode == RUN_MODE_STEP) emuState.runMode = RUN_MODE_AUTO;
+      else if (emuState.runMode == RUN_MODE_AUTO) emuState.runMode = RUN_MODE_STEP;
       break;
     case '[':
-      currentState.clockSpeed -= 10;
+      emuState.clockSpeed -= 10;
       updateScreen();
       break;
     case ']':
-      currentState.clockSpeed += 10;
+      emuState.clockSpeed += 10;
       updateScreen();
       break;
     case ';': // up arrow
@@ -228,6 +238,15 @@ void onKeyPress(char c) {
   }
 }
 
+void onCtrlKeyPress(char c) {
+  switch (c) {
+    case 'A':
+      emuHardReset();
+      emuAssembleAndLoad();
+      updateScreen();
+  }
+}
+
 int vectorFind(std::vector<char> v, char c) {
   for (int i=0;i<v.size();i++) {
     if (v[i]==c)
@@ -238,46 +257,63 @@ int vectorFind(std::vector<char> v, char c) {
 std::vector<char> lastKeysPressed;
 void loop() {
   M5Cardputer.update();
+
+  // Serial.println("loop");
+  Keyboard_Class::KeysState status = M5Cardputer.Keyboard.keysState();
+  bool updateKB=false;
   if (M5Cardputer.Keyboard.isChange()) {
     if (M5Cardputer.Keyboard.isPressed()) {
-      Keyboard_Class::KeysState status = M5Cardputer.Keyboard.keysState();
-      
-      for (char c : status.word) {
-        int idx = vectorFind(lastKeysPressed, tolower(c));
-        if (idx==-1) {
-          // if (status.ctrl)
-          //   onCtrlKeyPress(c);
-          // else if (status.fn)
-          //   onFnKeyPress(c);
-          // else if (status.opt)
-          //   onOptKeyPress(c);
-          // else
-            onKeyPress(c);
-          lastKeysPressed.push_back(c);
-        }
+      updateKB=true;
+      if (status.tab) {
+        interfaceState = (interfaceState==INTERFACE_EMU ? INTERFACE_EDITOR : INTERFACE_EMU);
+        if (interfaceState==INTERFACE_EMU)
+          updateScreen();
       }
-      if (status.enter) {
-        // onEnterPress();
-      }
-      if (status.del) {
-        // onDeletePress();
-      }
-      // updateScreen();
     }
-    for (int i=0;i<lastKeysPressed.size();i++) {
-      if (!M5Cardputer.Keyboard.isKeyPressed(lastKeysPressed[i])) {
-        lastKeysPressed.erase(lastKeysPressed.begin()+i);
+  }
+  if (interfaceState == INTERFACE_EDITOR) {
+    editorUpdate(updateKB);
+    return;
+  }
+  // Serial.println("hi");
+  if (updateKB) {
+    Keyboard_Class::KeysState status = M5Cardputer.Keyboard.keysState();
+    
+    for (char c : status.word) {
+      int idx = vectorFind(lastKeysPressed, tolower(c));
+      if (idx==-1) {
+        if (status.ctrl)
+          onCtrlKeyPress(c);
+        // else if (status.fn)
+        //   onFnKeyPress(c);
+        // else if (status.opt)
+        //   onOptKeyPress(c);
+        else
+          onKeyPress(c);
+        lastKeysPressed.push_back(c);
       }
+    }
+    if (status.enter) {
+      // onEnterPress();
+    }
+    if (status.del) {
+      // onDeletePress();
+    }
+    // updateScreen();
+  }
+  for (int i=0;i<lastKeysPressed.size();i++) {
+    if (!M5Cardputer.Keyboard.isKeyPressed(lastKeysPressed[i])) {
+      lastKeysPressed.erase(lastKeysPressed.begin()+i);
     }
   }
   // put your main code here, to run repeatedly
   // M5Cardputer.Display.clearDisplay(RED);
-  if (currentState.runMode == RUN_MODE_AUTO) {
+  if (emuState.runMode == RUN_MODE_AUTO) {
     emuTick();
   }
   // M5Cardputer.Display.drawString(,0,16);
   // M5Cardputer.Display.drawString(,0,32);
   // showRAMImage();
   lastMicros = micros();
-  delayMicroseconds(1000000/currentState.clockSpeed);
+  delayMicroseconds(1000000/emuState.clockSpeed);
 }

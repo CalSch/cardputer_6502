@@ -1,3 +1,3 @@
 6502 emulator: https://github.com/bzotto/MCS6502
-assembler (a02): https://github.com/RevCurtisP/C02
+assembler (6502pasm, made by yours truly): https://github.com/CalSch/6502pasm
 
